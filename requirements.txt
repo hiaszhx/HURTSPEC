@@ -1,0 +1,9 @@
+PySide6>=6.7.0
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+scikit-learn>=1.5.0
+matplotlib>=3.9.0
+PyWavelets>=1.6.0
+timm==0.4.5
+wget==3.2

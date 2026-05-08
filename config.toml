@@ -1,0 +1,59 @@
+# HURTSPEC S3PRL baseline config.
+# Run with:
+# E:\VScode_Python\.venv\Scripts\python.exe E:\VScode_Python\HURTSPEC\run_s3prl_baseline.py --config E:\VScode_Python\HURTSPEC\config.toml
+
+[paths]
+input_root = "data"
+output_root = "output_s3prl"
+s3prl_repo = "s3prl-main"
+
+[s3prl]
+# S3PRL upstream model name(s). Use a string for one model or a list for multiple models.
+# Example: upstream = ["hubert", "distilhubert"]
+upstream = ["hubert"]
+device = "auto"
+batch_size = 8
+
+[split]
+test_size = 0.2
+random_state = 42
+
+[classifier]
+# Classifier head after S3PRL embeddings.
+# mlp: Linear -> GELU -> Dropout -> Linear
+# linear: single Linear layer
+head_type = "linear" #mlp/linear
+epochs = 50
+lr = 0.001
+weight_decay = 0.0001
+hidden_dim = 256
+dropout = 0.3
+
+[preprocess]
+enabled = false
+# Steps run in this exact order when their own enabled flag is true.
+# Only these preprocessing steps are supported here: snv, wavelet, pls.
+order = ["snv", "wavelet", "pls"]
+
+[snv]
+enabled = true
+# Standard Normal Variate reduces per-sample intensity and scatter differences.
+eps = 0.000000000001
+
+[wavelet]
+enabled = true
+# Wavelet low-frequency drift correction.
+wavelet = "db6"
+level = 4
+mode = "symmetric"
+approximation_scale = 0.0
+
+[pls]
+enabled = true
+# 0 chooses components automatically from train split size and feature count.
+components = 0
+
+[outputs]
+save_embeddings = false
+save_preprocessed_spectra = false
+save_sample_index = true

@@ -1,0 +1,8 @@
+*.csv
+
+
+#上游模型
+s3prl-main
+
+#输出目录
+output_s3prl
