@@ -1,8 +1,11 @@
 *.csv
 
-
 #上游模型
 s3prl-main
 
 #输出目录
 output_s3prl
+#测试输出目录
+output_s3prl_predict
+#自己写的一些日志
+实验记录

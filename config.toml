@@ -10,9 +10,28 @@ s3prl_repo = "s3prl-main"
 [s3prl]
 # S3PRL upstream model name(s). Use a string for one model or a list for multiple models.
 # Example: upstream = ["hubert", "distilhubert"]
-upstream = ["hubert"]
+upstream = ["hubert_base","distilhubert_base","npc","tera","byol_a_2048","wavlm_base"]
 device = "auto"
 batch_size = 8
+
+# hubert
+# hubert_base
+# hubert_large_ll60k
+# distilhubert
+# distilhubert_base
+# wav2vec2
+# wav2vec2_base_960
+# wav2vec2_large_ll60k
+# wavlm
+# wavlm_base
+# wavlm_large
+# tera
+# apc
+# npc
+# mockingjay
+# byol_a_2048
+# lighthubert
+# lighthubert_base
 
 [split]
 test_size = 0.2

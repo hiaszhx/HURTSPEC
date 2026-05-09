@@ -84,6 +84,7 @@ class TrainEvalResult:
 class PLSCalibrationResult:
     X: np.ndarray
     metadata: dict
+    state: dict
 
 
 @dataclass
@@ -127,6 +128,7 @@ class OutputConfig:
 class SpectralPreprocessResult:
     X: np.ndarray
     metadata: dict
+    state: dict
 
 
 class SmallMLPHead(nn.Module):
@@ -464,7 +466,18 @@ def apply_pls_spectral_calibration(
         "reconstruction_rmse_train": train_reconstruction_rmse,
     }
 
-    return PLSCalibrationResult(X=X_calibrated, metadata=metadata)
+    state = {
+        "enabled": True,
+        "method": "PLSRegression PLS-DA spectral projection/reconstruction",
+        "n_components": int(n_components),
+        "n_features": int(X.shape[1]),
+        "scaler_mean": scaler.mean_.astype(np.float32),
+        "scaler_scale": scaler.scale_.astype(np.float32),
+        "x_rotations": pls.x_rotations_.astype(np.float32),
+        "x_loadings": pls.x_loadings_.astype(np.float32),
+    }
+
+    return PLSCalibrationResult(X=X_calibrated, metadata=metadata, state=state)
 
 
 def _parse_bool_value(value: str, field_name: str) -> bool:
@@ -617,10 +630,17 @@ def apply_configured_spectral_preprocessing(
         "steps": [],
         "input_shape": [int(X_work.shape[0]), int(X_work.shape[1])],
     }
+    state = {
+        "enabled": bool(config.enabled),
+        "requested_order": list(config.order),
+        "applied_order": [],
+        "steps": [],
+    }
 
     if not config.enabled:
         metadata["output_shape"] = [int(X_work.shape[0]), int(X_work.shape[1])]
-        return SpectralPreprocessResult(X=X_work, metadata=metadata)
+        state["output_shape"] = [int(X_work.shape[0]), int(X_work.shape[1])]
+        return SpectralPreprocessResult(X=X_work, metadata=metadata, state=state)
 
     for step in config.order:
         if step == "snv":
@@ -629,11 +649,19 @@ def apply_configured_spectral_preprocessing(
                 continue
             X_work = apply_snv(X_work, eps=config.snv.eps).astype(np.float32)
             metadata["applied_order"].append("snv")
+            state["applied_order"].append("snv")
             metadata["steps"].append(
                 {
                     "name": "snv",
                     "enabled": True,
                     "method": "standard_normal_variate",
+                    "eps": float(config.snv.eps),
+                }
+            )
+            state["steps"].append(
+                {
+                    "name": "snv",
+                    "enabled": True,
                     "eps": float(config.snv.eps),
                 }
             )
@@ -646,7 +674,18 @@ def apply_configured_spectral_preprocessing(
                 config.wavelet,
             )
             metadata["applied_order"].append("wavelet")
+            state["applied_order"].append("wavelet")
             metadata["steps"].append({"name": "wavelet", **wavelet_metadata})
+            state["steps"].append(
+                {
+                    "name": "wavelet",
+                    "enabled": True,
+                    "wavelet": config.wavelet.wavelet,
+                    "level": int(config.wavelet.level),
+                    "mode": config.wavelet.mode,
+                    "approximation_scale": float(config.wavelet.approximation_scale),
+                }
+            )
         elif step == "pls":
             if not config.pls.enabled:
                 metadata["steps"].append({"name": "pls", "enabled": False})
@@ -660,14 +699,17 @@ def apply_configured_spectral_preprocessing(
             )
             X_work = pls_result.X
             metadata["applied_order"].append("pls")
+            state["applied_order"].append("pls")
             metadata["steps"].append({"name": "pls", **pls_result.metadata})
+            state["steps"].append({"name": "pls", **pls_result.state})
         else:
             raise BaselineError(f"Unknown preprocess step: {step}")
 
     metadata["output_shape"] = [int(X_work.shape[0]), int(X_work.shape[1])]
     metadata["wave_min"] = float(np.min(wave_work))
     metadata["wave_max"] = float(np.max(wave_work))
-    return SpectralPreprocessResult(X=X_work, metadata=metadata)
+    state["output_shape"] = [int(X_work.shape[0]), int(X_work.shape[1])]
+    return SpectralPreprocessResult(X=X_work, metadata=metadata, state=state)
 
 
 def _find_step_metadata(preprocess_metadata: dict, step_name: str) -> dict:
@@ -1234,6 +1276,8 @@ def run_baseline(
     _plot_training_curve(result.history, figures_dir / "training_curve.png")
 
     torch.save(result.checkpoint, output_dir / "best_classifier_head.pt")
+    torch.save(preprocess_result.state, output_dir / "preprocess_state.pt")
+    pd.DataFrame({"wave": aligned.wave_grid}).to_csv(output_dir / "wave_grid.csv", index=False)
 
     result.report_test.to_csv(output_dir / "classification_report_test.csv", index=False)
     result.report_all.to_csv(output_dir / "classification_report_all.csv", index=False)
@@ -1434,8 +1478,203 @@ def load_config(config_path: str | Path) -> BaselineConfig:
     )
 
 
+def _extract_multi_model_row(
+    upstream: str,
+    model_dir: Path,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    test_metrics = summary["metrics"]["test"]
+    all_metrics = summary["metrics"]["all_data"]
+    complexity = summary.get("complexity", {})
+    upstream_complexity = complexity.get("upstream", {})
+    head_complexity = complexity.get("classifier_head", {})
+    total_params = complexity.get("total_params", {})
+    training = complexity.get("training", {})
+    dataset = summary.get("dataset", {})
+
+    test_f1 = float(test_metrics["f1_macro"])
+    all_data_f1 = float(all_metrics["f1_macro"])
+    combined_params = int(total_params.get("combined_total_params", 0) or 0)
+    upstream_flops = upstream_complexity.get("upstream_forward_flops_per_sample")
+    n_test = int(test_metrics.get("n_samples", dataset.get("n_test", 0)) or 0)
+    test_accuracy = float(test_metrics["accuracy"])
+
+    return {
+        "status": "ok",
+        "upstream": upstream,
+        "test_f1_macro": test_f1,
+        "test_accuracy": test_accuracy,
+        "test_balanced_accuracy": float(test_metrics["balanced_accuracy"]),
+        "test_precision_macro": float(test_metrics["precision_macro"]),
+        "test_recall_macro": float(test_metrics["recall_macro"]),
+        "test_mcc": float(test_metrics["mcc"]),
+        "test_error_count": int(round((1.0 - test_accuracy) * n_test)),
+        "all_data_f1_macro": all_data_f1,
+        "all_data_accuracy": float(all_metrics["accuracy"]),
+        "all_data_test_f1_gap": float(all_data_f1 - test_f1),
+        "best_epoch": int(training.get("best_epoch", 0) or 0),
+        "best_epoch_macro_f1": float(training.get("best_epoch_macro_f1", np.nan)),
+        "embedding_dim": int(upstream_complexity.get("embedding_dim", 0) or 0),
+        "upstream_params": int(total_params.get("upstream_total_params", 0) or 0),
+        "classifier_head_params": int(total_params.get("classifier_head_total_params", 0) or 0),
+        "combined_params": combined_params,
+        "combined_params_m": float(combined_params / 1_000_000.0) if combined_params else np.nan,
+        "upstream_gflops_per_sample": (
+            float(upstream_flops) / 1_000_000_000.0 if upstream_flops is not None else np.nan
+        ),
+        "classifier_kflops_per_sample": float(
+            (head_complexity.get("forward_flops_per_sample", 0) or 0) / 1_000.0
+        ),
+        "f1_per_million_params": (
+            float(test_f1 / (combined_params / 1_000_000.0)) if combined_params else np.nan
+        ),
+        "output_dir": str(model_dir),
+        "error": "",
+    }
+
+
+def _plot_multi_upstream_metrics(rows: list[dict[str, Any]], output_path: Path) -> None:
+    if not rows:
+        return
+
+    plot_rows = sorted(rows, key=lambda row: float(row["test_f1_macro"]), reverse=True)
+    labels = [row["upstream"] for row in plot_rows]
+    metric_specs = [
+        ("test_f1_macro", "Test Macro F1"),
+        ("test_accuracy", "Test Accuracy"),
+        ("test_balanced_accuracy", "Test Balanced Acc."),
+    ]
+
+    x = np.arange(len(labels))
+    width = 0.24
+    colors = ["#0072B2", "#009E73", "#D55E00"]
+
+    with plt.rc_context(
+        {
+            "font.family": "DejaVu Serif",
+            "axes.linewidth": 0.9,
+            "axes.edgecolor": "black",
+            "axes.labelsize": 10,
+            "axes.titlesize": 11,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 9,
+            "legend.fontsize": 8,
+            "figure.dpi": 160,
+            "savefig.dpi": 300,
+        }
+    ):
+        fig, ax = plt.subplots(figsize=(9.2, 4.8))
+        for idx, (key, label) in enumerate(metric_specs):
+            values = [float(row[key]) for row in plot_rows]
+            bars = ax.bar(
+                x + (idx - 1) * width,
+                values,
+                width=width,
+                label=label,
+                color=colors[idx],
+                edgecolor="black",
+                linewidth=0.6,
+            )
+            for bar, value in zip(bars, values):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    value + 0.008,
+                    f"{value:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=90,
+                )
+
+        ax.set_ylabel("Score")
+        ax.set_title("Upstream Model Classification Performance")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=25, ha="right")
+        ax.set_ylim(0.0, min(1.08, max(1.0, max(float(row["test_f1_macro"]) for row in plot_rows) + 0.12)))
+        ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.45)
+        ax.legend(frameon=False, ncols=3, loc="upper center", bbox_to_anchor=(0.5, 1.14))
+        fig.tight_layout()
+        fig.savefig(output_path)
+        plt.close(fig)
+
+
+def _plot_multi_upstream_complexity(rows: list[dict[str, Any]], output_path: Path) -> None:
+    if not rows:
+        return
+
+    plot_rows = sorted(rows, key=lambda row: float(row["combined_params_m"]))
+    labels = [row["upstream"] for row in plot_rows]
+    params_m = [float(row["combined_params_m"]) for row in plot_rows]
+    gflops = [float(row["upstream_gflops_per_sample"]) for row in plot_rows]
+    f1_scores = [float(row["test_f1_macro"]) for row in plot_rows]
+
+    x = np.arange(len(labels))
+    with plt.rc_context(
+        {
+            "font.family": "DejaVu Serif",
+            "axes.linewidth": 0.9,
+            "axes.edgecolor": "black",
+            "axes.labelsize": 10,
+            "axes.titlesize": 11,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 9,
+            "legend.fontsize": 8,
+            "figure.dpi": 160,
+            "savefig.dpi": 300,
+        }
+    ):
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharex=True)
+
+        axes[0].bar(
+            x,
+            params_m,
+            color="#0072B2",
+            edgecolor="black",
+            linewidth=0.6,
+        )
+        axes[0].set_ylabel("Parameters (M)")
+        axes[0].set_title("Model Size")
+        axes[0].grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.45)
+
+        axes[1].bar(
+            x,
+            gflops,
+            color="#D55E00",
+            edgecolor="black",
+            linewidth=0.6,
+        )
+        axes[1].set_ylabel("Upstream GFLOPs / sample")
+        axes[1].set_title("Forward Compute")
+        axes[1].grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.45)
+
+        for ax in axes:
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=30, ha="right")
+
+        ax_f1 = axes[1].twinx()
+        ax_f1.plot(
+            x,
+            f1_scores,
+            color="black",
+            marker="o",
+            linewidth=1.3,
+            markersize=4,
+            label="Test Macro F1",
+        )
+        ax_f1.set_ylabel("Test Macro F1")
+        ax_f1.set_ylim(0.0, 1.0)
+        ax_f1.legend(frameon=False, loc="upper right")
+
+        fig.suptitle("Upstream Model Size, Compute, and Accuracy Trade-off", y=1.02, fontsize=12)
+        fig.tight_layout()
+        fig.savefig(output_path)
+        plt.close(fig)
+
+
 def run_multi_upstream(config: BaselineConfig) -> Path:
     parent_dir = _create_multi_output_dir(Path(config.output_root))
+    figures_dir = parent_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
     total = len(config.upstreams)
     _log_progress("", f"Multi-upstream run started: {total} models")
     _log_progress("", f"Output folder: {parent_dir}")
@@ -1459,19 +1698,11 @@ def run_multi_upstream(config: BaselineConfig) -> Path:
             with open(summary_path, "r", encoding="utf-8") as f:
                 summary = json.load(f)
 
-            test_metrics = summary["metrics"]["test"]
-            all_metrics = summary["metrics"]["all_data"]
-            row = {
-                "status": "ok",
-                "upstream": upstream,
-                "test_f1_macro": float(test_metrics["f1_macro"]),
-                "test_accuracy": float(test_metrics["accuracy"]),
-                "test_balanced_accuracy": float(test_metrics["balanced_accuracy"]),
-                "all_data_f1_macro": float(all_metrics["f1_macro"]),
-                "all_data_accuracy": float(all_metrics["accuracy"]),
-                "output_dir": str(model_dir),
-                "error": "",
-            }
+            row = _extract_multi_model_row(
+                upstream=upstream,
+                model_dir=model_dir,
+                summary=summary,
+            )
             rows.append(row)
             summaries.append(summary)
             _log_progress(
@@ -1487,8 +1718,23 @@ def run_multi_upstream(config: BaselineConfig) -> Path:
                     "test_f1_macro": np.nan,
                     "test_accuracy": np.nan,
                     "test_balanced_accuracy": np.nan,
+                    "test_precision_macro": np.nan,
+                    "test_recall_macro": np.nan,
+                    "test_mcc": np.nan,
+                    "test_error_count": np.nan,
                     "all_data_f1_macro": np.nan,
                     "all_data_accuracy": np.nan,
+                    "all_data_test_f1_gap": np.nan,
+                    "best_epoch": np.nan,
+                    "best_epoch_macro_f1": np.nan,
+                    "embedding_dim": np.nan,
+                    "upstream_params": np.nan,
+                    "classifier_head_params": np.nan,
+                    "combined_params": np.nan,
+                    "combined_params_m": np.nan,
+                    "upstream_gflops_per_sample": np.nan,
+                    "classifier_kflops_per_sample": np.nan,
+                    "f1_per_million_params": np.nan,
                     "output_dir": str(model_dir),
                     "error": str(exc),
                 }
@@ -1511,6 +1757,11 @@ def run_multi_upstream(config: BaselineConfig) -> Path:
                 ensure_ascii=False,
             )
         raise BaselineError(f"No upstream model completed successfully. See {parent_dir}")
+
+    _log_progress("", "Drawing multi-model comparison figures...")
+    _plot_multi_upstream_metrics(ok_rows, figures_dir / "model_metrics_bar.png")
+    _plot_multi_upstream_complexity(ok_rows, figures_dir / "model_complexity_bar.png")
+    pd.DataFrame(rows).to_csv(parent_dir / "model_comparison.csv", index=False)
 
     best_row = max(
         ok_rows,
@@ -1547,7 +1798,13 @@ def run_multi_upstream(config: BaselineConfig) -> Path:
                 "best_upstream": best_row["upstream"],
                 "best_model": best_row,
                 "models": rows,
-                "artifacts": ["model_comparison.csv", "best_model.json", "run_summary.json"],
+                "artifacts": [
+                    "model_comparison.csv",
+                    "best_model.json",
+                    "run_summary.json",
+                    "figures/model_metrics_bar.png",
+                    "figures/model_complexity_bar.png",
+                ],
             },
             f,
             indent=2,
