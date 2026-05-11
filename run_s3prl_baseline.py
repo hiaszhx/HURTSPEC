@@ -55,6 +55,8 @@ class BaselineConfig:
     classifier_head_type: str
     classifier_hidden_dim: int
     classifier_dropout: float
+    classifier_label_smoothing_enabled: bool
+    classifier_label_smoothing: float
     preprocess: "SpectralPreprocessConfig"
     outputs: "OutputConfig"
 
@@ -69,6 +71,7 @@ class TrainEvalResult:
     y_test_pred: np.ndarray
     cm_test: np.ndarray
     y_all_pred: np.ndarray
+    y_all_logits: np.ndarray
     cm_all: np.ndarray
     metrics_test: dict
     metrics_all: dict
@@ -799,6 +802,8 @@ def _plot_training_curve(history: pd.DataFrame, output_path: Path) -> None:
 
 
 def _compute_pca_scores(emb: np.ndarray) -> np.ndarray:
+    if emb.ndim != 2 or min(emb.shape) < 2:
+        raise BaselineError(f"Need a 2D matrix with at least 2 rows and 2 columns for PCA, got {emb.shape}")
     pca = PCA(n_components=2, random_state=42)
     return pca.fit_transform(emb)
 
@@ -808,6 +813,7 @@ def _plot_pca_true_labels(
     y: np.ndarray,
     class_names: Sequence[str],
     output_path: Path,
+    title: str = "PCA of S3PRL Upstream Embeddings (True Labels)",
 ) -> None:
     markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
     cmap = plt.get_cmap("tab10")
@@ -829,7 +835,7 @@ def _plot_pca_true_labels(
             linewidths=0.4,
         )
 
-    ax.set_title("PCA of S3PRL Embeddings (True Labels)")
+    ax.set_title(title)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
     ax.grid(alpha=0.25)
@@ -902,6 +908,8 @@ def train_and_evaluate(
     classifier_head_type: str,
     classifier_hidden_dim: int,
     classifier_dropout: float,
+    classifier_label_smoothing_enabled: bool,
+    classifier_label_smoothing: float,
     train_indices: np.ndarray | None = None,
     test_indices: np.ndarray | None = None,
 ) -> TrainEvalResult:
@@ -944,6 +952,9 @@ def train_and_evaluate(
     dropout = float(classifier_dropout)
     if not 0.0 <= dropout < 1.0:
         raise BaselineError("classifier_dropout must be >= 0 and < 1.")
+    label_smoothing = float(classifier_label_smoothing) if classifier_label_smoothing_enabled else 0.0
+    if not 0.0 <= label_smoothing < 1.0:
+        raise BaselineError("classifier.label_smoothing must be >= 0 and < 1.")
 
     class_counts = np.bincount(y_train, minlength=n_classes).astype(np.float32)
     class_counts = np.where(class_counts <= 0, 1.0, class_counts)
@@ -959,7 +970,10 @@ def train_and_evaluate(
             num_classes=n_classes,
             dropout=dropout,
         ).to(torch_device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights_tensor,
+        label_smoothing=label_smoothing,
+    )
     optimizer = Adam(
         head.parameters(),
         lr=float(classifier_lr),
@@ -1028,6 +1042,7 @@ def train_and_evaluate(
         X_all_tensor = torch.from_numpy(X_all_scaled).to(torch_device)
         all_logits = head(X_all_tensor)
         pred_all = torch.argmax(all_logits, dim=1).cpu().numpy()
+        all_logits_np = all_logits.cpu().numpy()
 
     cm_test = confusion_matrix(y_test_np, pred_test, labels=np.arange(len(class_names)))
     cm_all = confusion_matrix(y, pred_all, labels=np.arange(len(class_names)))
@@ -1074,6 +1089,8 @@ def train_and_evaluate(
             "classifier_head_type": head_type,
             "classifier_hidden_dim": int(hidden_dim) if head_type == "mlp" else None,
             "classifier_dropout": float(dropout) if head_type == "mlp" else 0.0,
+            "classifier_label_smoothing_enabled": bool(classifier_label_smoothing_enabled),
+            "classifier_label_smoothing": float(label_smoothing),
             "n_train": int(len(y_train)),
             "n_test": int(len(y_test)),
             "n_all": int(len(y)),
@@ -1089,6 +1106,7 @@ def train_and_evaluate(
         "num_classes": int(n_classes),
         "activation": "GELU" if head_type == "mlp" else None,
         "dropout": float(dropout) if head_type == "mlp" else 0.0,
+        "label_smoothing": float(label_smoothing),
         "class_names": list(class_names),
         "best_epoch": int(best_epoch),
         "best_epoch_macro_f1": float(best_macro_f1),
@@ -1101,6 +1119,7 @@ def train_and_evaluate(
         y_test_pred=pred_test,
         cm_test=cm_test,
         y_all_pred=pred_all,
+        y_all_logits=all_logits_np,
         cm_all=cm_all,
         metrics_test=metrics_test,
         metrics_all=metrics_all,
@@ -1209,12 +1228,19 @@ def run_baseline(
         classifier_head_type=config.classifier_head_type,
         classifier_hidden_dim=config.classifier_hidden_dim,
         classifier_dropout=config.classifier_dropout,
+        classifier_label_smoothing_enabled=config.classifier_label_smoothing_enabled,
+        classifier_label_smoothing=config.classifier_label_smoothing,
         train_indices=train_idx,
         test_indices=test_idx,
     )
 
     _log_progress(progress_prefix, "Saving metrics, CSV files, and figures...")
-    pca_scores = _compute_pca_scores(emb)
+    input_pca_scores = _compute_pca_scores(aligned.X)
+    upstream_pca_scores = _compute_pca_scores(emb)
+    classifier_logit_pca_scores = _compute_pca_scores(result.y_all_logits)
+    preprocessed_pca_scores = None
+    if preprocess_result.metadata.get("applied_order"):
+        preprocessed_pca_scores = _compute_pca_scores(X_for_embedding)
 
     pd.DataFrame(
         {
@@ -1257,14 +1283,40 @@ def run_baseline(
     )
 
     _plot_pca_true_labels(
-        pca_scores=pca_scores,
+        pca_scores=input_pca_scores,
+        y=aligned.y,
+        class_names=aligned.class_names,
+        output_path=figures_dir / "pca_input_spectra.png",
+        title="PCA of Input Spectra (True Labels)",
+    )
+
+    if preprocessed_pca_scores is not None:
+        _plot_pca_true_labels(
+            pca_scores=preprocessed_pca_scores,
+            y=aligned.y,
+            class_names=aligned.class_names,
+            output_path=figures_dir / "pca_preprocessed_spectra.png",
+            title="PCA of Preprocessed Spectra (True Labels)",
+        )
+
+    _plot_pca_true_labels(
+        pca_scores=upstream_pca_scores,
         y=aligned.y,
         class_names=aligned.class_names,
         output_path=figures_dir / "pca_true_labels.png",
+        title="PCA of S3PRL Upstream Embeddings (True Labels)",
+    )
+
+    _plot_pca_true_labels(
+        pca_scores=classifier_logit_pca_scores,
+        y=aligned.y,
+        class_names=aligned.class_names,
+        output_path=figures_dir / "pca_classifier_logits.png",
+        title="PCA of Classifier Head Logits (True Labels)",
     )
 
     _plot_pca_test_predictions(
-        pca_scores=pca_scores,
+        pca_scores=upstream_pca_scores,
         y_true=np.asarray(result.y_test, dtype=int),
         y_pred=np.asarray(result.y_test_pred, dtype=int),
         test_indices=np.asarray(result.test_indices, dtype=int),
@@ -1469,6 +1521,8 @@ def load_config(config_path: str | Path) -> BaselineConfig:
         classifier_head_type=str(classifier.get("head_type", "mlp")).strip().lower(),
         classifier_hidden_dim=int(classifier.get("hidden_dim", 256)),
         classifier_dropout=float(classifier.get("dropout", 0.3)),
+        classifier_label_smoothing_enabled=bool(classifier.get("label_smoothing_enabled", False)),
+        classifier_label_smoothing=float(classifier.get("label_smoothing", 0.0)),
         preprocess=preprocess_config,
         outputs=OutputConfig(
             save_embeddings=bool(outputs.get("save_embeddings", True)),

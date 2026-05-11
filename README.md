@@ -43,6 +43,16 @@ figures/model_metrics_bar.png
 figures/model_complexity_bar.png
 ```
 
+Single-model training figures include PCA views of the pipeline:
+
+```text
+figures/pca_input_spectra.png
+figures/pca_preprocessed_spectra.png       # only when preprocessing actually runs
+figures/pca_true_labels.png                # S3PRL upstream embedding PCA
+figures/pca_test_predictions.png           # upstream embedding PCA, test errors marked
+figures/pca_classifier_logits.png          # classifier-head output PCA
+```
+
 PNG figures are saved under the run folder's `figures` subfolder. Run parameters,
 metrics, preprocessing metadata, model complexity, and artifact names are stored
 in one `run_summary.json`.
@@ -60,6 +70,14 @@ The classifier head is selected in `[classifier]`:
 
 ```toml
 head_type = "mlp"     # or "linear"
+```
+
+Label smoothing is optional:
+
+```toml
+[classifier]
+label_smoothing_enabled = false
+label_smoothing = 0.1
 ```
 
 ## Predict New Data
