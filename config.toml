@@ -41,7 +41,8 @@ random_state = 42
 # Classifier head after S3PRL embeddings.
 # mlp: Linear -> GELU -> Dropout -> Linear
 # linear: single Linear layer
-head_type = "linear" #mlp/linear
+# prototype: projection encoder + learnable class prototypes, optionally with SupCon loss
+head_type = "mlp" #mlp/linear/prototype
 epochs = 50
 lr = 0.001
 weight_decay = 0.0001
@@ -50,12 +51,20 @@ dropout = 0.3
 # Label smoothing can reduce over-confident classifier-head training.
 label_smoothing_enabled = false
 label_smoothing = 0.1
+# Prototype Head settings.
+prototype_dim = 128
+prototype_temperature = 0.1
+# Supervised Contrastive Loss is added to CE as: loss = CE + supcon_weight * SupCon.
+supcon_enabled = true
+supcon_weight = 0.1
+supcon_temperature = 0.1
 
 [preprocess]
-enabled = false
+enabled = true
 # Steps run in this exact order when their own enabled flag is true.
-# Only these preprocessing steps are supported here: snv, wavelet, pls.
-order = ["snv", "wavelet", "pls"]
+# Supported steps: snv, wavelet, band_selection, pls.
+# Baseline: keep enabled=false or set band_selection.enabled=false.
+order = ["band_selection"]
 
 [snv]
 enabled = true
@@ -74,6 +83,45 @@ approximation_scale = 0.0
 enabled = true
 # 0 chooses components automatically from train split size and feature count.
 components = 0
+
+[band_selection]
+enabled = false
+# Manual: manual. Traditional/heuristic: pls_vip, lasso, cars, ga. Learnable: learnable_gate, band_attention.
+# Baseline/no selection: method = "none" or enabled = false.
+# fusion_mode = "dual": full continuous spectrum -> S3PRL, selected bands -> classifier head.
+# fusion_mode = "single": selected bands are stitched and sent to S3PRL.
+fusion_mode = "dual"
+method = "manual" # manual / pls_vip / lasso / cars / ga / learnable_gate / band_attention
+# Manual ranges can be discontinuous. Used only when method = "manual".
+# Example: manual_ranges = [[420, 520], [760, 820], [910, 960]]
+manual_ranges = [[400, 1300]]
+# top_k > 0 has priority. Otherwise top_ratio selects a fraction of bands.
+top_k = 0
+top_ratio = 0.5
+min_bands = 32
+# Used by pls_vip and cars. 0 chooses automatically.
+pls_components = 0
+# L1 strength for lasso; larger values select fewer bands.
+lasso_alpha = 0.05
+
+# CARS Monte Carlo settings.
+cars_iterations = 40
+cars_sample_ratio = 0.8
+
+# GA settings. Fitness is internal train-split PLS-DA validation accuracy.
+ga_population = 24
+ga_generations = 30
+ga_crossover_rate = 0.8
+ga_mutation_rate = 0.08
+ga_elite_count = 2
+
+# Learnable Band Gate / Band Attention settings.
+epochs = 200
+lr = 0.01
+weight_decay = 0.0001
+hidden_dim = 64
+temperature = 1.0
+sparsity_lambda = 0.001
 
 [outputs]
 save_embeddings = false

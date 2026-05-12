@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from run_s3prl_baseline import (
     BaselineError,
     LinearHead,
+    PrototypeHead,
     SmallMLPHead,
     WaveletDriftStepConfig,
     _compute_classification_metrics,
@@ -155,16 +156,34 @@ def _apply_pls_state(X: np.ndarray, step: dict[str, Any]) -> np.ndarray:
     return (X_reconstructed_scaled * scale + mean).astype(np.float32)
 
 
+def _apply_band_selection_state(X: np.ndarray, step: dict[str, Any]) -> np.ndarray:
+    method = str(step.get("method", "none")).strip().lower()
+    if method == "none":
+        return np.asarray(X, dtype=np.float32)
+
+    indices = np.asarray(step["selected_indices"], dtype=int)
+    expected = int(step.get("original_n_features", X.shape[1]))
+    if X.shape[1] != expected:
+        raise BaselineError(
+            "Band selection state feature count does not match input spectra. "
+            f"Expected {expected}, got {X.shape[1]}."
+        )
+    if indices.size < 1 or np.min(indices) < 0 or np.max(indices) >= X.shape[1]:
+        raise BaselineError("Saved band selection indices are invalid for this input.")
+    return np.asarray(X[:, indices], dtype=np.float32)
+
+
 def _apply_saved_preprocessing(
     X: np.ndarray,
     preprocess_state: dict[str, Any],
     summary_config: dict[str, Any],
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray | None]:
     X_work = np.asarray(X, dtype=np.float32)
+    selected_band_features: np.ndarray | None = None
     preprocess_cfg = summary_config.get("preprocess", {})
 
     if not bool(preprocess_state.get("enabled", preprocess_cfg.get("enabled", False))):
-        return X_work
+        return X_work, None
 
     for step_name in preprocess_state.get("applied_order", []):
         if step_name == "snv":
@@ -185,10 +204,23 @@ def _apply_saved_preprocessing(
             if step is None:
                 raise BaselineError("PLS was applied during training, but PLS state is missing.")
             X_work = _apply_pls_state(X_work, step)
+        elif step_name == "band_selection":
+            step = _find_step(preprocess_state, "band_selection")
+            if step is None:
+                raise BaselineError(
+                    "Band selection was applied during training, but its state is missing."
+                )
+            fusion_mode = str(step.get("fusion_mode", "single")).strip().lower()
+            selected = _apply_band_selection_state(X_work, step)
+            if fusion_mode == "dual":
+                selected_band_features = selected
+            else:
+                X_work = selected
+                selected_band_features = None
         else:
             raise BaselineError(f"Unknown saved preprocessing step: {step_name}")
 
-    return X_work
+    return X_work, selected_band_features
 
 
 def _build_head(checkpoint: dict[str, Any], device: torch.device) -> torch.nn.Module:
@@ -198,6 +230,15 @@ def _build_head(checkpoint: dict[str, Any], device: torch.device) -> torch.nn.Mo
 
     if head_type == "linear":
         head = LinearHead(input_dim=input_dim, num_classes=num_classes)
+    elif head_type == "prototype":
+        head = PrototypeHead(
+            input_dim=input_dim,
+            hidden_dim=int(checkpoint["hidden_dim"]),
+            prototype_dim=int(checkpoint["prototype_dim"]),
+            num_classes=num_classes,
+            dropout=float(checkpoint.get("dropout", 0.0)),
+            temperature=float(checkpoint.get("prototype_temperature", 0.1)),
+        )
     elif head_type in {"mlp", "small_mlp_2linear"}:
         head = SmallMLPHead(
             input_dim=input_dim,
@@ -271,7 +312,7 @@ def predict_single_model(
             )
 
     print("Applying saved preprocessing...", flush=True)
-    X_proc = _apply_saved_preprocessing(X, preprocess_state, cfg)
+    X_proc, selected_band_features = _apply_saved_preprocessing(X, preprocess_state, cfg)
 
     print(f"Extracting embeddings with upstream={upstream}...", flush=True)
     emb, upstream_stats = extract_embeddings(
@@ -287,7 +328,26 @@ def predict_single_model(
     head = _build_head(checkpoint, device)
     scaler_mean = np.asarray(checkpoint["scaler_mean"], dtype=np.float32)
     scaler_scale = np.asarray(checkpoint["scaler_scale"], dtype=np.float32)
-    emb_scaled = ((emb.astype(np.float32) - scaler_mean) / scaler_scale).astype(np.float32)
+    fusion = checkpoint.get("feature_fusion", {})
+    selected_dim = int(fusion.get("selected_band_feature_dim", 0) or 0)
+    if selected_dim > 0:
+        if selected_band_features is None:
+            raise BaselineError(
+                "This checkpoint expects selected band features, but preprocessing did not produce them."
+            )
+        if selected_band_features.shape[1] != selected_dim:
+            raise BaselineError(
+                "Selected band feature dimension does not match checkpoint. "
+                f"Expected {selected_dim}, got {selected_band_features.shape[1]}."
+            )
+        model_input = np.concatenate(
+            [emb.astype(np.float32), selected_band_features.astype(np.float32)],
+            axis=1,
+        ).astype(np.float32)
+    else:
+        model_input = emb.astype(np.float32)
+
+    emb_scaled = ((model_input - scaler_mean) / scaler_scale).astype(np.float32)
 
     with torch.no_grad():
         logits = head(torch.from_numpy(emb_scaled).to(device))
@@ -351,6 +411,12 @@ def predict_single_model(
         "class_names": class_names,
         "metrics": metrics_payload,
         "upstream_stats": upstream_stats,
+        "feature_fusion": {
+            "mode": fusion.get("mode", "s3prl_embedding_only"),
+            "s3prl_embedding_dim": int(emb.shape[1]),
+            "selected_band_feature_dim": int(selected_dim),
+            "model_input_dim": int(model_input.shape[1]),
+        },
         "artifacts": sorted(
             str(path.relative_to(output_dir)).replace("\\", "/")
             for path in output_dir.rglob("*")
