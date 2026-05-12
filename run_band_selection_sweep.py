@@ -23,17 +23,20 @@ from run_s3prl_baseline import (
 
 SWEEP_METHODS = [
     "none",
-    "manual",
-    "pls_vip",
-    "cars",
-    "learnable_gate",
-    "band_attention",
+    # "manual",
+    
+    # "pls_vip",
+    # "cars",
+    # # "iwoa",
+    # "learnable_gate",
+    # "band_attention",
 ]
 RATIO_METHODS = [
-    "pls_vip",
-    "cars",
-    "learnable_gate",
-    "band_attention",
+    # "pls_vip",
+    # "cars",
+    # # "iwoa",
+    # "learnable_gate",
+    # "band_attention",
 ]
 SWEEP_RATIOS = [0.25, 0.5, 0.75]
 DEFAULT_REPEATS = 1
@@ -67,6 +70,13 @@ def _manual_branch_setting_name(fusion_mode: str) -> str:
 
 def _repeat_setting_name(method: str, ratio: float | None, repeat: int) -> str:
     return f"repeat_{int(repeat):02d}_{_setting_name(method, ratio)}"
+
+
+def _order_with_band_selection(base_order: list[str]) -> list[str]:
+    order = [step for step in base_order if step]
+    if "band_selection" not in order:
+        order.append("band_selection")
+    return order
 
 
 def _build_setting_config(
@@ -110,7 +120,7 @@ def _build_setting_config(
     preprocess = replace(
         base_config.preprocess,
         enabled=True,
-        order=["band_selection"],
+        order=_order_with_band_selection(base_config.preprocess.order),
         band_selection=band_selection,
     )
     return replace(
@@ -145,7 +155,7 @@ def _build_manual_branch_config(
     preprocess = replace(
         base_config.preprocess,
         enabled=True,
-        order=["band_selection"],
+        order=_order_with_band_selection(base_config.preprocess.order),
         band_selection=band_selection,
     )
     return replace(
@@ -299,12 +309,14 @@ def _plot_metric_lines(rows: list[dict[str, Any]], output_path: Path) -> None:
     colors = {
         "pls_vip": "#1F4E79",
         "cars": "#008B8B",
+        "iwoa": "#7A5195",
         "learnable_gate": "#B2182B",
         "band_attention": "#D55E00",
     }
     markers = {
         "pls_vip": "o",
         "cars": "s",
+        "iwoa": "^",
         "learnable_gate": "D",
         "band_attention": "P",
     }
@@ -376,6 +388,20 @@ def _plot_upstream_lines(rows: list[dict[str, Any]], output_path: Path) -> None:
         return
 
     methods = list(RATIO_METHODS)
+    colors = {
+        "pls_vip": "#1F4E79",
+        "cars": "#008B8B",
+        "iwoa": "#7A5195",
+        "learnable_gate": "#B2182B",
+        "band_attention": "#D55E00",
+    }
+    markers = {
+        "pls_vip": "o",
+        "cars": "s",
+        "iwoa": "^",
+        "learnable_gate": "D",
+        "band_attention": "P",
+    }
     with plt.rc_context(
         {
             "font.family": "DejaVu Serif",
@@ -396,7 +422,7 @@ def _plot_upstream_lines(rows: list[dict[str, Any]], output_path: Path) -> None:
         fig, axes = plt.subplots(
             n_rows,
             n_cols,
-            figsize=(4.2 * n_cols, 3.2 * n_rows),
+            figsize=(4.35 * n_cols, 3.2 * n_rows),
             sharex=True,
             sharey=True,
             constrained_layout=True,
@@ -421,9 +447,10 @@ def _plot_upstream_lines(rows: list[dict[str, Any]], output_path: Path) -> None:
                 ax.plot(
                     method_rows["top_ratio"],
                     method_rows["test_f1_macro"],
-                    marker="o",
+                    marker=markers.get(method, "o"),
                     linewidth=1.2,
                     markersize=3.5,
+                    color=colors.get(method, "black"),
                     label=method,
                 )
             if not np.isnan(baseline):
@@ -458,10 +485,17 @@ def _plot_upstream_lines(rows: list[dict[str, Any]], output_path: Path) -> None:
                     handles.append(handle)
                     labels.append(label)
         if handles:
-            fig.legend(handles, labels, frameon=False, ncols=3, loc="upper center")
+            fig.legend(
+                handles,
+                labels,
+                frameon=False,
+                ncols=1,
+                loc="center left",
+                bbox_to_anchor=(1.01, 0.5),
+            )
         fig.supxlabel("Selected band ratio")
         fig.supylabel("Test Macro F1")
-        fig.savefig(output_path)
+        fig.savefig(output_path, bbox_inches="tight")
         plt.close(fig)
 
 

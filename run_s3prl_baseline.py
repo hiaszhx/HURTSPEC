@@ -118,6 +118,14 @@ class PLSStepConfig:
 
 
 @dataclass
+class SegmentNormalizeStepConfig:
+    enabled: bool = False
+    ranges: list[tuple[float, float]] | None = None
+    method: str = "zscore"
+    eps: float = 1e-12
+
+
+@dataclass
 class BandSelectionStepConfig:
     enabled: bool = False
     method: str = "none"
@@ -135,6 +143,10 @@ class BandSelectionStepConfig:
     ga_crossover_rate: float = 0.8
     ga_mutation_rate: float = 0.08
     ga_elite_count: int = 2
+    iwoa_population: int = 24
+    iwoa_iterations: int = 30
+    iwoa_b: float = 1.0
+    iwoa_mutation_rate: float = 0.05
     epochs: int = 200
     lr: float = 0.01
     weight_decay: float = 0.0001
@@ -150,6 +162,7 @@ class SpectralPreprocessConfig:
     snv: SNVStepConfig
     wavelet: WaveletDriftStepConfig
     pls: PLSStepConfig
+    segment_normalize: SegmentNormalizeStepConfig
     band_selection: BandSelectionStepConfig
 
 
@@ -711,6 +724,121 @@ def _manual_band_indices(
     return selected
 
 
+def _segment_indices_for_ranges(
+    wave_grid: np.ndarray,
+    ranges: list[tuple[float, float]] | None,
+    field_name: str,
+) -> list[np.ndarray]:
+    if not ranges:
+        raise BaselineError(
+            f"{field_name} requires at least one wavelength range, "
+            "for example [[400, 1500], [1800, 2500]]."
+        )
+
+    wave_grid = np.asarray(wave_grid, dtype=float)
+    segments: list[np.ndarray] = []
+    used = np.zeros(wave_grid.shape[0], dtype=bool)
+    for low, high in ranges:
+        indices = np.flatnonzero((wave_grid >= float(low)) & (wave_grid <= float(high))).astype(int)
+        if indices.size < 1:
+            raise BaselineError(
+                f"{field_name} range [{low}, {high}] did not match any wavelength points."
+            )
+        if np.any(used[indices]):
+            raise BaselineError(f"{field_name} contains overlapping wavelength ranges.")
+        used[indices] = True
+        segments.append(indices)
+    return segments
+
+
+def _normalize_segments(
+    X: np.ndarray,
+    segments: list[np.ndarray],
+    method: str,
+    eps: float,
+) -> np.ndarray:
+    method = str(method).strip().lower()
+    if method not in {"zscore", "standard", "standardize", "minmax", "none"}:
+        raise BaselineError("segment_normalize.method must be 'zscore', 'minmax', or 'none'.")
+
+    X = np.asarray(X, dtype=np.float32)
+    eps = max(float(eps), 1e-12)
+    normalized_parts: list[np.ndarray] = []
+    for indices in segments:
+        part = X[:, indices].astype(np.float32, copy=True)
+        if method in {"zscore", "standard", "standardize"}:
+            mean = np.mean(part, axis=1, keepdims=True)
+            std = np.std(part, axis=1, keepdims=True)
+            part = (part - mean) / np.maximum(std, eps)
+        elif method == "minmax":
+            minimum = np.min(part, axis=1, keepdims=True)
+            maximum = np.max(part, axis=1, keepdims=True)
+            part = (part - minimum) / np.maximum(maximum - minimum, eps)
+        normalized_parts.append(part.astype(np.float32))
+    return np.concatenate(normalized_parts, axis=1).astype(np.float32)
+
+
+def apply_segment_normalization(
+    X: np.ndarray,
+    wave_grid: np.ndarray,
+    config: SegmentNormalizeStepConfig,
+) -> tuple[np.ndarray, np.ndarray, dict, dict]:
+    X = np.asarray(X, dtype=np.float32)
+    wave_grid = np.asarray(wave_grid, dtype=float)
+    if X.ndim != 2:
+        raise BaselineError(f"Expected 2D spectral matrix, got shape {X.shape}")
+    if X.shape[1] != wave_grid.shape[0]:
+        raise BaselineError(
+            "Segment normalization feature count does not match wave grid. "
+            f"X has {X.shape[1]} bands, wave grid has {wave_grid.shape[0]}."
+        )
+
+    segments = _segment_indices_for_ranges(
+        wave_grid=wave_grid,
+        ranges=config.ranges,
+        field_name="segment_normalize.ranges",
+    )
+    X_out = _normalize_segments(
+        X=X,
+        segments=segments,
+        method=config.method,
+        eps=float(config.eps),
+    )
+    selected_indices = np.concatenate(segments).astype(int)
+    wave_out = wave_grid[selected_indices].astype(float)
+    segment_lengths = [int(indices.size) for indices in segments]
+    segment_slices = []
+    start = 0
+    for length in segment_lengths:
+        segment_slices.append([int(start), int(start + length)])
+        start += length
+
+    ranges = [[float(low), float(high)] for low, high in (config.ranges or [])]
+    metadata = {
+        "enabled": True,
+        "method": str(config.method).strip().lower(),
+        "ranges": ranges,
+        "n_segments": int(len(segments)),
+        "original_band_count": int(X.shape[1]),
+        "selected_band_count": int(selected_indices.size),
+        "removed_band_count": int(X.shape[1] - selected_indices.size),
+        "selected_ratio": float(selected_indices.size / X.shape[1]),
+        "segment_lengths": segment_lengths,
+        "segment_slices": segment_slices,
+        "normalization_scope": "per sample and per configured wavelength segment",
+    }
+    state = {
+        **metadata,
+        "selected_indices": selected_indices.astype(np.int64),
+        "input_waves": wave_grid.astype(np.float32),
+        "selected_waves": wave_out.astype(np.float32),
+        "eps": float(config.eps),
+        "original_n_features": int(X.shape[1]),
+        "output_n_features": int(selected_indices.size),
+    }
+    return X_out, wave_out, metadata, state
+
+
 def _coef_feature_importance(coef: np.ndarray, n_features: int) -> np.ndarray:
     coef = np.asarray(coef, dtype=np.float64)
     if coef.ndim == 1:
@@ -1025,6 +1153,172 @@ def _ga_band_scores(
     }
 
 
+def _top_mask_from_position(position: np.ndarray, n_select: int) -> np.ndarray:
+    position = np.asarray(position, dtype=np.float64)
+    mask = np.zeros(position.size, dtype=bool)
+    mask[np.argsort(position)[::-1][:n_select]] = True
+    return mask
+
+
+def _iwoa_band_scores(
+    X_train_scaled: np.ndarray,
+    y_train: np.ndarray,
+    n_classes: int,
+    config: BandSelectionStepConfig,
+    n_select: int,
+    random_state: int,
+) -> tuple[np.ndarray, dict]:
+    rng = np.random.default_rng(int(random_state))
+    n_train, n_features = X_train_scaled.shape
+    n_select = int(max(1, min(n_select, n_features)))
+
+    if n_select >= n_features:
+        return np.ones(n_features, dtype=np.float64), {
+            "iwoa_population": 0,
+            "iwoa_iterations": 0,
+            "iwoa_internal_validation_accuracy": None,
+            "iwoa_note": "selected band count covers all features; iWOA search skipped",
+        }
+
+    population_size = max(6, int(config.iwoa_population))
+    iterations = max(1, int(config.iwoa_iterations))
+    spiral_b = max(1e-6, float(config.iwoa_b))
+    mutation_rate = min(1.0, max(0.0, float(config.iwoa_mutation_rate)))
+
+    if n_train >= 8 and len(np.unique(y_train)) > 1:
+        try:
+            fit_idx, val_idx = train_test_split(
+                np.arange(n_train),
+                test_size=0.25,
+                random_state=int(random_state),
+                stratify=y_train,
+            )
+        except ValueError:
+            fit_idx = np.arange(n_train)
+            val_idx = np.arange(n_train)
+    else:
+        fit_idx = np.arange(n_train)
+        val_idx = np.arange(n_train)
+
+    Y = _one_hot_labels(y_train, n_classes=n_classes)
+    fitness_cache: dict[tuple[int, ...], float] = {}
+
+    def evaluate(mask: np.ndarray) -> float:
+        selected = tuple(np.flatnonzero(mask).astype(int).tolist())
+        if selected in fitness_cache:
+            return fitness_cache[selected]
+
+        selected_array = np.asarray(selected, dtype=int)
+        try:
+            n_components = _resolve_pls_components(
+                requested_components=int(config.pls_components),
+                n_train=len(fit_idx),
+                n_features=selected_array.size,
+            )
+            pls = PLSRegression(n_components=n_components, scale=False)
+            pls.fit(X_train_scaled[np.ix_(fit_idx, selected_array)], Y[fit_idx])
+            pred = pls.predict(X_train_scaled[np.ix_(val_idx, selected_array)])
+            pred_labels = np.argmax(pred, axis=1)
+            fitness = float(np.mean(pred_labels == y_train[val_idx]))
+        except Exception:
+            fitness = -1.0
+
+        fitness_cache[selected] = fitness
+        return fitness
+
+    logistic = rng.random((population_size, n_features))
+    for _ in range(8):
+        logistic = 4.0 * logistic * (1.0 - logistic)
+    positions = np.clip(logistic, 0.0, 1.0)
+
+    try:
+        vip_scores, _ = _pls_vip_scores(
+            X_train_scaled=X_train_scaled,
+            y_train=y_train,
+            n_classes=n_classes,
+            requested_components=int(config.pls_components),
+        )
+        vip_scores = np.nan_to_num(vip_scores, nan=0.0, posinf=0.0, neginf=0.0)
+        vip_min = float(np.min(vip_scores))
+        vip_range = float(np.max(vip_scores) - vip_min)
+        if vip_range > 1e-12:
+            positions[0] = (vip_scores - vip_min) / vip_range
+    except Exception:
+        pass
+
+    masks = [_top_mask_from_position(position, n_select=n_select) for position in positions]
+    fitness_values = np.asarray([evaluate(mask) for mask in masks], dtype=np.float64)
+    best_idx = int(np.argmax(fitness_values))
+    best_position = positions[best_idx].copy()
+    best_mask = masks[best_idx].copy()
+    best_fitness = float(fitness_values[best_idx])
+    selection_frequency = np.zeros(n_features, dtype=np.float64)
+    evaluations = 0
+
+    for iteration in range(iterations):
+        fitness_values = np.asarray([evaluate(mask) for mask in masks], dtype=np.float64)
+        current_best_idx = int(np.argmax(fitness_values))
+        if float(fitness_values[current_best_idx]) > best_fitness:
+            best_fitness = float(fitness_values[current_best_idx])
+            best_position = positions[current_best_idx].copy()
+            best_mask = masks[current_best_idx].copy()
+
+        for mask, fitness in zip(masks, fitness_values):
+            weight = max(float(fitness), 0.0) + 1e-3
+            selection_frequency += mask.astype(np.float64) * weight
+            evaluations += 1
+
+        if iteration == iterations - 1:
+            break
+
+        progress = iteration / max(1, iterations - 1)
+        a = 2.0 * (1.0 - progress**2)
+        inertia = 0.9 - 0.5 * progress
+        next_positions = positions.copy()
+        for i in range(population_size):
+            r1 = rng.random(n_features)
+            r2 = rng.random(n_features)
+            A = 2.0 * a * r1 - a
+            C = 2.0 * r2
+            p = rng.random()
+
+            if p < 0.5:
+                if float(np.mean(np.abs(A))) < 1.0:
+                    distance = np.abs(C * best_position - positions[i])
+                    candidate = best_position - A * distance
+                else:
+                    random_position = positions[int(rng.integers(0, population_size))]
+                    distance = np.abs(C * random_position - positions[i])
+                    candidate = random_position - A * distance
+            else:
+                distance = np.abs(best_position - positions[i])
+                l = rng.uniform(-1.0, 1.0, size=n_features)
+                candidate = distance * np.exp(spiral_b * l) * np.cos(2.0 * np.pi * l) + best_position
+
+            candidate = inertia * positions[i] + (1.0 - inertia) * candidate
+            if rng.random() < mutation_rate:
+                mutation_mask = rng.random(n_features) < max(mutation_rate, 1.0 / n_features)
+                if np.any(mutation_mask):
+                    candidate[mutation_mask] += rng.normal(0.0, 0.15, size=int(np.sum(mutation_mask)))
+
+            next_positions[i] = np.clip(candidate, 0.0, 1.0)
+
+        positions = next_positions
+        masks = [_top_mask_from_position(position, n_select=n_select) for position in positions]
+
+    scores = selection_frequency / max(1, evaluations)
+    scores[best_mask] += 1.0
+    return scores, {
+        "iwoa_population": int(population_size),
+        "iwoa_iterations": int(iterations),
+        "iwoa_b": float(spiral_b),
+        "iwoa_mutation_rate": float(mutation_rate),
+        "iwoa_internal_validation_accuracy": float(best_fitness),
+        "iwoa_evaluated_unique_subsets": int(len(fitness_cache)),
+        "iwoa_note": "binary iWOA with logistic chaotic initialization, nonlinear convergence factor, inertia weighting, and Gaussian mutation",
+    }
+
+
 def _learnable_band_scores(
     X_train_scaled: np.ndarray,
     y_train: np.ndarray,
@@ -1121,6 +1415,10 @@ def apply_band_selection(
         "ga": "ga",
         "genetic": "ga",
         "genetic_algorithm": "ga",
+        "iwoa": "iwoa",
+        "woa": "iwoa",
+        "improved_woa": "iwoa",
+        "improved_whale": "iwoa",
         "learnable_gate": "learnable_gate",
         "band_gate": "learnable_gate",
         "gate": "learnable_gate",
@@ -1130,7 +1428,7 @@ def apply_band_selection(
     if method not in aliases:
         raise BaselineError(
             "Unknown band_selection.method. Allowed: none, manual, pls_vip, "
-            "lasso, cars, ga, learnable_gate, band_attention."
+            "lasso, cars, ga, iwoa, learnable_gate, band_attention."
         )
     method = aliases[method]
     if method == "none":
@@ -1246,6 +1544,15 @@ def apply_band_selection(
             n_select=n_select,
             random_state=int(random_state),
         )
+    elif method == "iwoa":
+        scores, extra_metadata = _iwoa_band_scores(
+            X_train_scaled=X_train_scaled,
+            y_train=y_train,
+            n_classes=n_classes,
+            config=config,
+            n_select=n_select,
+            random_state=int(random_state),
+        )
     else:
         scores, extra_metadata = _learnable_band_scores(
             X_train_scaled=X_train_scaled,
@@ -1345,6 +1652,13 @@ def _parse_preprocess_order(order_value: Any) -> list[str]:
         "pls": "pls",
         "wavelet": "wavelet",
         "wavelet_transform": "wavelet",
+        "segment_normalize": "segment_normalize",
+        "segment-normalize": "segment_normalize",
+        "segment_norm": "segment_normalize",
+        "range_normalize": "segment_normalize",
+        "range_norm": "segment_normalize",
+        "range_select": "segment_normalize",
+        "spectral_ranges": "segment_normalize",
         "band_selection": "band_selection",
         "band-select": "band_selection",
         "band_select": "band_selection",
@@ -1371,7 +1685,7 @@ def _parse_preprocess_order(order_value: Any) -> list[str]:
         raise BaselineError(
             "Unknown preprocess step(s): "
             + ", ".join(unknown)
-            + ". Allowed steps are: snv, wavelet, band_selection, pls."
+            + ". Allowed steps are: snv, wavelet, segment_normalize, band_selection, pls."
         )
     if len(order) != len(set(order)):
         raise BaselineError("Preprocess order contains duplicate steps.")
@@ -1476,7 +1790,30 @@ def apply_configured_spectral_preprocessing(
         metadata["output_shape"] = [int(X_work.shape[0]), int(X_work.shape[1])]
         metadata["selected_band_feature_shape"] = None
         state["output_shape"] = [int(X_work.shape[0]), int(X_work.shape[1])]
-        return SpectralPreprocessResult(X=X_work, metadata=metadata, state=state)
+        return SpectralPreprocessResult(
+            X=X_work,
+            metadata=metadata,
+            state=state,
+        )
+
+    band_selection_active = (
+        bool(config.band_selection.enabled)
+        and str(config.band_selection.method).strip().lower() not in {"none", "baseline"}
+    )
+    if bool(config.segment_normalize.enabled) and band_selection_active:
+        if "segment_normalize" not in config.order:
+            raise BaselineError(
+                "segment_normalize.enabled=true with active band_selection, but "
+                "segment_normalize is missing from preprocess.order. Use "
+                'order = ["segment_normalize", "band_selection"] so band_selection '
+                "can only see the cropped segments."
+            )
+        if "band_selection" in config.order and config.order.index("segment_normalize") > config.order.index("band_selection"):
+            raise BaselineError(
+                "segment_normalize must run before band_selection. Use "
+                'order = ["segment_normalize", "band_selection"] so band_selection '
+                "cannot select wavelengths outside the configured segments."
+            )
 
     for step in config.order:
         if step == "snv":
@@ -1522,6 +1859,19 @@ def apply_configured_spectral_preprocessing(
                     "approximation_scale": float(config.wavelet.approximation_scale),
                 }
             )
+        elif step == "segment_normalize":
+            if not config.segment_normalize.enabled:
+                metadata["steps"].append({"name": "segment_normalize", "enabled": False})
+                continue
+            X_work, wave_work, segment_metadata, segment_state = apply_segment_normalization(
+                X=X_work,
+                wave_grid=wave_work,
+                config=config.segment_normalize,
+            )
+            metadata["applied_order"].append("segment_normalize")
+            state["applied_order"].append("segment_normalize")
+            metadata["steps"].append({"name": "segment_normalize", **segment_metadata})
+            state["steps"].append({"name": "segment_normalize", **segment_state})
         elif step == "pls":
             if not config.pls.enabled:
                 metadata["steps"].append({"name": "pls", "enabled": False})
@@ -1632,7 +1982,6 @@ def extract_embeddings(
         **_count_model_params(model),
         **_estimate_upstream_forward_flops_per_sample(model, wavs[0], torch_device),
     }
-
     embeddings = []
 
     with torch.no_grad():
@@ -2115,7 +2464,6 @@ def train_and_evaluate(
         checkpoint=checkpoint,
     )
 
-
 def _save_confusion_matrix_plot(
     cm: np.ndarray,
     class_names: Sequence[str],
@@ -2487,10 +2835,12 @@ def run_baseline(
     if config.outputs.save_sample_index:
         loaded.to_index_frame().to_csv(output_dir / "sample_index.csv", index=False)
     band_selection_state = None
+    segment_normalize_state = None
     for step_state in preprocess_result.state.get("steps", []):
         if step_state.get("name") == "band_selection":
             band_selection_state = step_state
-            break
+        elif step_state.get("name") == "segment_normalize":
+            segment_normalize_state = step_state
 
     band_summary = {
         "enabled": bool(band_selection_metadata.get("enabled", False)),
@@ -2522,36 +2872,71 @@ def run_baseline(
     if band_selection_state is not None and band_selection_state.get("method") != "none":
         selected_indices = np.asarray(band_selection_state["selected_indices"], dtype=int)
         selected_waves = np.asarray(band_selection_state["selected_waves"], dtype=float)
-        pd.DataFrame(
-            {
-                "selected_rank": np.arange(1, selected_indices.size + 1),
-                "band_index": selected_indices,
-                "wave": selected_waves,
-            }
-        ).to_csv(output_dir / "selected_bands.csv", index=False)
+        original_selected_indices = selected_indices
+        candidate_original_indices = None
         scores = np.asarray(band_selection_state.get("selection_scores", []), dtype=float)
-        if scores.size:
-            pd.DataFrame(
-                {
-                    "band_index": np.arange(scores.size, dtype=int),
-                    "wave": aligned.wave_grid[: scores.size],
-                    "score": scores,
-                    "selected": np.isin(np.arange(scores.size), selected_indices),
-                }
-            ).to_csv(output_dir / "band_selection_scores.csv", index=False)
         input_waves = np.asarray(
             band_selection_state.get("input_waves", aligned.wave_grid[: scores.size]),
             dtype=float,
         )
-        if input_waves.shape[0] == aligned.X.shape[1]:
-            _plot_band_selection_heatmap(
-                X=aligned.X,
-                wave_grid=input_waves,
-                selected_indices=selected_indices,
-                selection_scores=scores,
-                output_path=figures_dir / "band_selection_heatmap.png",
-                method=str(band_selection_state.get("method", "band_selection")),
+
+        if segment_normalize_state is not None:
+            segment_indices = np.asarray(
+                segment_normalize_state.get("selected_indices", []),
+                dtype=int,
             )
+            selected_in_segment = (
+                selected_indices.size == 0
+                or (np.min(selected_indices) >= 0 and np.max(selected_indices) < segment_indices.size)
+            )
+            if (
+                segment_indices.size >= max(input_waves.size, scores.size)
+                and selected_in_segment
+            ):
+                candidate_original_indices = segment_indices[: max(input_waves.size, scores.size)]
+                original_selected_indices = segment_indices[selected_indices]
+
+        pd.DataFrame(
+            {
+                "selected_rank": np.arange(1, selected_indices.size + 1),
+                "band_index": selected_indices,
+                "original_band_index": original_selected_indices,
+                "wave": selected_waves,
+            }
+        ).to_csv(output_dir / "selected_bands.csv", index=False)
+        if scores.size:
+            score_waves = input_waves if input_waves.size == scores.size else aligned.wave_grid[: scores.size]
+            score_original_indices = (
+                candidate_original_indices[: scores.size]
+                if candidate_original_indices is not None and candidate_original_indices.size >= scores.size
+                else np.arange(scores.size, dtype=int)
+            )
+            pd.DataFrame(
+                {
+                    "band_index": np.arange(scores.size, dtype=int),
+                    "original_band_index": score_original_indices,
+                    "wave": score_waves,
+                    "score": scores,
+                    "selected": np.isin(np.arange(scores.size), selected_indices),
+                }
+            ).to_csv(output_dir / "band_selection_scores.csv", index=False)
+
+        plot_scores = scores
+        plot_selected_indices = selected_indices
+        if input_waves.shape[0] != aligned.X.shape[1] and candidate_original_indices is not None:
+            plot_scores = np.zeros(aligned.X.shape[1], dtype=float)
+            if scores.size:
+                plot_scores[candidate_original_indices[: scores.size]] = scores
+            plot_selected_indices = original_selected_indices
+
+        _plot_band_selection_heatmap(
+            X=aligned.X,
+            wave_grid=aligned.wave_grid,
+            selected_indices=plot_selected_indices,
+            selection_scores=plot_scores,
+            output_path=figures_dir / "band_selection_heatmap.png",
+            method=str(band_selection_state.get("method", "band_selection")),
+        )
 
     complexity = {
         "preprocess_pipeline": preprocess_result.metadata,
@@ -2704,6 +3089,7 @@ def load_config(config_path: str | Path) -> BaselineConfig:
     snv = _section(data, "snv")
     wavelet = _section(data, "wavelet")
     pls = _section(data, "pls")
+    segment_normalize = _section(data, "segment_normalize")
     band_selection = _section(data, "band_selection")
 
     preprocess_config = SpectralPreprocessConfig(
@@ -2723,6 +3109,15 @@ def load_config(config_path: str | Path) -> BaselineConfig:
         pls=PLSStepConfig(
             enabled=bool(pls.get("enabled", True)),
             components=int(pls.get("components", 0)),
+        ),
+        segment_normalize=SegmentNormalizeStepConfig(
+            enabled=bool(segment_normalize.get("enabled", False)),
+            ranges=_parse_range_list(
+                segment_normalize.get("ranges"),
+                "segment_normalize.ranges",
+            ),
+            method=str(segment_normalize.get("method", "zscore")).strip().lower(),
+            eps=float(segment_normalize.get("eps", 1e-12)),
         ),
         band_selection=BandSelectionStepConfig(
             enabled=bool(band_selection.get("enabled", False)),
@@ -2744,6 +3139,10 @@ def load_config(config_path: str | Path) -> BaselineConfig:
             ga_crossover_rate=float(band_selection.get("ga_crossover_rate", 0.8)),
             ga_mutation_rate=float(band_selection.get("ga_mutation_rate", 0.08)),
             ga_elite_count=int(band_selection.get("ga_elite_count", 2)),
+            iwoa_population=int(band_selection.get("iwoa_population", 24)),
+            iwoa_iterations=int(band_selection.get("iwoa_iterations", 30)),
+            iwoa_b=float(band_selection.get("iwoa_b", 1.0)),
+            iwoa_mutation_rate=float(band_selection.get("iwoa_mutation_rate", 0.05)),
             epochs=int(band_selection.get("epochs", 200)),
             lr=float(band_selection.get("lr", 0.01)),
             weight_decay=float(band_selection.get("weight_decay", 0.0001)),

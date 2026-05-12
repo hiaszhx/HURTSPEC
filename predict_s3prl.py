@@ -15,11 +15,13 @@ from run_s3prl_baseline import (
     BaselineError,
     LinearHead,
     PrototypeHead,
+    SegmentNormalizeStepConfig,
     SmallMLPHead,
     WaveletDriftStepConfig,
     _compute_classification_metrics,
     _save_confusion_matrix_plot,
     _safe_name,
+    apply_segment_normalization,
     apply_wavelet_drift_removal,
     extract_embeddings,
 )
@@ -173,6 +175,31 @@ def _apply_band_selection_state(X: np.ndarray, step: dict[str, Any]) -> np.ndarr
     return np.asarray(X[:, indices], dtype=np.float32)
 
 
+def _apply_segment_normalize_state(X: np.ndarray, step: dict[str, Any]) -> np.ndarray:
+    expected = int(step.get("original_n_features", X.shape[1]))
+    if X.shape[1] != expected:
+        raise BaselineError(
+            "Segment normalization state feature count does not match input spectra. "
+            f"Expected {expected}, got {X.shape[1]}."
+        )
+
+    wave_grid = np.asarray(step.get("input_waves"), dtype=float)
+    if wave_grid.ndim != 1 or wave_grid.shape[0] != X.shape[1]:
+        raise BaselineError("Saved segment normalization wave grid is invalid.")
+
+    ranges = step.get("ranges")
+    if not ranges:
+        raise BaselineError("Saved segment normalization ranges are missing.")
+    cfg = SegmentNormalizeStepConfig(
+        enabled=True,
+        ranges=[(float(low), float(high)) for low, high in ranges],
+        method=str(step.get("method", "zscore")),
+        eps=float(step.get("eps", 1e-12)),
+    )
+    X_out, _, _, _ = apply_segment_normalization(X=X, wave_grid=wave_grid, config=cfg)
+    return X_out
+
+
 def _apply_saved_preprocessing(
     X: np.ndarray,
     preprocess_state: dict[str, Any],
@@ -199,6 +226,13 @@ def _apply_saved_preprocessing(
                 approximation_scale=float(step.get("approximation_scale", 0.0)),
             )
             X_work, _ = apply_wavelet_drift_removal(X_work, wavelet_cfg)
+        elif step_name == "segment_normalize":
+            step = _find_step(preprocess_state, "segment_normalize")
+            if step is None:
+                raise BaselineError(
+                    "Segment normalization was applied during training, but its state is missing."
+                )
+            X_work = _apply_segment_normalize_state(X_work, step)
         elif step_name == "pls":
             step = _find_step(preprocess_state, "pls")
             if step is None:
@@ -312,7 +346,11 @@ def predict_single_model(
             )
 
     print("Applying saved preprocessing...", flush=True)
-    X_proc, selected_band_features = _apply_saved_preprocessing(X, preprocess_state, cfg)
+    X_proc, selected_band_features = _apply_saved_preprocessing(
+        X,
+        preprocess_state,
+        cfg,
+    )
 
     print(f"Extracting embeddings with upstream={upstream}...", flush=True)
     emb, upstream_stats = extract_embeddings(

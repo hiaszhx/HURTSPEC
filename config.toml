@@ -42,7 +42,7 @@ random_state = 42
 # mlp: Linear -> GELU -> Dropout -> Linear
 # linear: single Linear layer
 # prototype: projection encoder + learnable class prototypes, optionally with SupCon loss
-head_type = "mlp" #mlp/linear/prototype
+head_type = "linear" #mlp/linear/prototype
 epochs = 50
 lr = 0.001
 weight_decay = 0.0001
@@ -62,7 +62,7 @@ supcon_temperature = 0.1
 [preprocess]
 enabled = true
 # Steps run in this exact order when their own enabled flag is true.
-# Supported steps: snv, wavelet, band_selection, pls.
+# Supported steps: snv, wavelet, segment_normalize, band_selection, pls.
 # Baseline: keep enabled=false or set band_selection.enabled=false.
 order = ["band_selection"]
 
@@ -84,17 +84,31 @@ enabled = true
 # 0 chooses components automatically from train split size and feature count.
 components = 0
 
+[segment_normalize]
+enabled = true
+# Select one or more wavelength windows and normalize each window separately.
+# This is independent from [band_selection]. Example:
+# order = ["segment_normalize", "band_selection"]
+# When both are enabled, segment_normalize must run before band_selection.
+# ranges = [[400, 1500], [1800, 2500]]
+ranges = [[400, 1500], [1800, 2500]]
+# zscore: per-sample zero mean/unit std inside each segment.
+# minmax: per-sample 0-1 scaling inside each segment.
+# none: only crop/concatenate the configured segments.
+method = "zscore"
+eps = 0.000000000001
+
 [band_selection]
-enabled = false
-# Manual: manual. Traditional/heuristic: pls_vip, lasso, cars, ga. Learnable: learnable_gate, band_attention.
+enabled = true
+# Manual: manual. Traditional/heuristic: pls_vip, lasso, cars, ga, iwoa. Learnable: learnable_gate, band_attention.
 # Baseline/no selection: method = "none" or enabled = false.
 # fusion_mode = "dual": full continuous spectrum -> S3PRL, selected bands -> classifier head.
 # fusion_mode = "single": selected bands are stitched and sent to S3PRL.
-fusion_mode = "dual"
-method = "manual" # manual / pls_vip / lasso / cars / ga / learnable_gate / band_attention
+fusion_mode = "single"  #single / dual
+method = "manual" # manual / pls_vip / lasso / cars / ga / iwoa / learnable_gate / band_attention
 # Manual ranges can be discontinuous. Used only when method = "manual".
 # Example: manual_ranges = [[420, 520], [760, 820], [910, 960]]
-manual_ranges = [[400, 1300]]
+manual_ranges = [[400, 1800]]
 # top_k > 0 has priority. Otherwise top_ratio selects a fraction of bands.
 top_k = 0
 top_ratio = 0.5
@@ -114,6 +128,12 @@ ga_generations = 30
 ga_crossover_rate = 0.8
 ga_mutation_rate = 0.08
 ga_elite_count = 2
+
+# iWOA settings. Fitness is internal train-split PLS-DA validation accuracy.
+iwoa_population = 24
+iwoa_iterations = 30
+iwoa_b = 1.0
+iwoa_mutation_rate = 0.05
 
 # Learnable Band Gate / Band Attention settings.
 epochs = 200

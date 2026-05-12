@@ -63,7 +63,7 @@ Preprocessing is intentionally limited to:
 
 ```toml
 [preprocess]
-order = ["snv", "wavelet", "band_selection", "pls"]
+order = ["snv", "wavelet", "segment_normalize", "band_selection", "pls"]
 ```
 
 Band selection is optional and is off by default, so the baseline remains
@@ -76,16 +76,37 @@ order = ["band_selection"]
 
 [band_selection]
 enabled = true
-method = "pls_vip"         # none, manual, pls_vip, lasso, cars, ga, learnable_gate, band_attention
+method = "pls_vip"         # none, manual, pls_vip, lasso, cars, ga, iwoa, learnable_gate, band_attention
 manual_ranges = []         # e.g. [[420, 520], [760, 820]] when method = "manual"
 top_ratio = 0.25           # or set top_k > 0
 min_bands = 16
 ```
 
+To crop discontinuous spectral windows as a normal preprocessing step and
+normalize each window independently, use `segment_normalize`. This is separate
+from `band_selection` and can be used alone or before it. When both are enabled,
+`segment_normalize` must appear before `band_selection`; otherwise the run stops
+instead of allowing band selection to see wavelengths outside the configured
+segments:
+
+```toml
+[preprocess]
+enabled = true
+order = ["segment_normalize", "band_selection"]
+
+[segment_normalize]
+enabled = true
+ranges = [[400, 1500], [1800, 2500]]
+method = "zscore"  # zscore, minmax, or none
+```
+
 Manual selection (`manual`) keeps all wavelength points inside the configured,
 possibly discontinuous ranges. Traditional selectors fit only on the train split:
 `pls_vip`, `lasso`, `cars`, and the GA selector (`ga`), which evolves fixed-size
-band subsets using internal PLS-DA validation accuracy as fitness. Learnable selectors (`learnable_gate`,
+band subsets using internal PLS-DA validation accuracy as fitness. The improved
+whale optimizer (`iwoa`) uses the same fixed-size subset fitness, with chaotic
+initialization, nonlinear convergence, inertia weighting, and mutation to search
+for informative wavelength subsets. Learnable selectors (`learnable_gate`,
 `band_attention`) train a small band-scoring network on the train split.
 
 When band selection is enabled, HURTSPEC uses a two-branch fusion path: the full
@@ -105,9 +126,10 @@ E:\VScode_Python\.venv\Scripts\python.exe E:\VScode_Python\HURTSPEC\run_band_sel
 ```
 
 The sweep evaluates no band selection, manual selection once using
-`band_selection.manual_ranges`, plus `pls_vip`, `cars`, `learnable_gate`, and
+`band_selection.manual_ranges`, plus `pls_vip`, `cars`, `iwoa`, `learnable_gate`, and
 `band_attention` at `top_ratio = 0.25, 0.5, 0.75`. By default it repeats the
-whole plan 3 times with different `random_state` values.
+whole plan once with the configured `random_state`; pass `--repeats 3` to repeat
+with three consecutive `random_state` values.
 It writes `band_selection_sweep_results.csv`,
 `band_selection_sweep_summary.csv`, and line figures under the sweep output
 folder. Use `--sweep-dir {existing_folder}` to resume into a previous sweep
